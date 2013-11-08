@@ -71,10 +71,6 @@ struct _GstXImageSrc
   /* Protect X Windows calls */
   GMutex  x_lock;
 
-  /* Gathered pool of emitted buffers */
-  GMutex  pool_lock;
-  GSList *buffer_pool;
-
   /* XFixes and XDamage support */
   gboolean have_xfixes;
   gboolean have_xdamage;
