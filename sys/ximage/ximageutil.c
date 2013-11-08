@@ -325,35 +325,62 @@ gst_ximagesrc_buffer_dispose (GstBuffer * ximage)
   meta = GST_META_XIMAGE_GET (ximage);
 
   parent = meta->parent;
-  if (parent == NULL) {
+  if (parent == NULL)
     g_warning ("XImageSrcBuffer->ximagesrc == NULL");
-    goto beach;
-  }
 
-  if (meta->return_func)
-    meta->return_func (parent, ximage);
-
-beach:
   return;
 }
 
-void
-gst_ximage_buffer_free (GstBuffer * ximage)
+/* This function destroys a GstXImageBuffer handling XShm availability */
+static void
+gst_ximagesrc_buffer_free (GstBuffer * ximage)
 {
   GstMetaXImage *meta;
+  GstXContext *xcontext;
 
   meta = GST_META_XIMAGE_GET (ximage);
 
-  /* make sure it is not recycled */
-  meta->width = -1;
-  meta->height = -1;
-  gst_buffer_unref (ximage);
+  xcontext = meta->xcontext;
+
+  /* We might have some buffers destroyed after changing state to NULL */
+  if (!xcontext)
+    goto beach;
+
+  g_return_if_fail (ximage != NULL);
+
+#ifdef HAVE_XSHM
+  if (xcontext->use_xshm) {
+    if (meta->SHMInfo.shmaddr != ((void *) -1)) {
+      XShmDetach (xcontext->disp, &meta->SHMInfo);
+      XSync (xcontext->disp, 0);
+      shmdt (meta->SHMInfo.shmaddr);
+    }
+    if (meta->ximage)
+      XDestroyImage (meta->ximage);
+
+  } else
+#endif /* HAVE_XSHM */
+  {
+    if (meta->ximage) {
+      XDestroyImage (meta->ximage);
+    }
+  }
+
+  XSync (xcontext->disp, FALSE);
+beach:
+  if (meta->parent) {
+    /* Release the ref to our parent */
+    gst_object_unref (meta->parent);
+    meta->parent = NULL;
+  }
+
+  return;
 }
 
 /* This function handles GstXImageSrcBuffer creation depending on XShm availability */
 GstBuffer *
 gst_ximageutil_ximage_new (GstXContext * xcontext,
-    GstElement * parent, int width, int height, BufferReturnFunc return_func)
+    GstElement * parent, int width, int height)
 {
   GstBuffer *ximage = NULL;
   GstMetaXImage *meta;
@@ -362,6 +389,8 @@ gst_ximageutil_ximage_new (GstXContext * xcontext,
   ximage = gst_buffer_new ();
   GST_MINI_OBJECT_CAST (ximage)->dispose =
       (GstMiniObjectDisposeFunction) gst_ximagesrc_buffer_dispose;
+  GST_MINI_OBJECT_CAST (ximage)->free =
+      (GstMiniObjectFreeFunction) gst_ximagesrc_buffer_free;
 
   meta = GST_META_XIMAGE_ADD (ximage);
   meta->width = width;
@@ -430,55 +459,12 @@ gst_ximageutil_ximage_new (GstXContext * xcontext,
 
   /* Keep a ref to our src */
   meta->parent = gst_object_ref (parent);
-  meta->return_func = return_func;
+  meta->xcontext = xcontext;
 beach:
   if (!succeeded) {
-    gst_ximage_buffer_free (ximage);
+    gst_buffer_unref (ximage);
     ximage = NULL;
   }
 
   return ximage;
-}
-
-/* This function destroys a GstXImageBuffer handling XShm availability */
-void
-gst_ximageutil_ximage_destroy (GstXContext * xcontext, GstBuffer * ximage)
-{
-  GstMetaXImage *meta;
-
-  meta = GST_META_XIMAGE_GET (ximage);
-
-  /* We might have some buffers destroyed after changing state to NULL */
-  if (!xcontext)
-    goto beach;
-
-  g_return_if_fail (ximage != NULL);
-
-#ifdef HAVE_XSHM
-  if (xcontext->use_xshm) {
-    if (meta->SHMInfo.shmaddr != ((void *) -1)) {
-      XShmDetach (xcontext->disp, &meta->SHMInfo);
-      XSync (xcontext->disp, 0);
-      shmdt (meta->SHMInfo.shmaddr);
-    }
-    if (meta->ximage)
-      XDestroyImage (meta->ximage);
-
-  } else
-#endif /* HAVE_XSHM */
-  {
-    if (meta->ximage) {
-      XDestroyImage (meta->ximage);
-    }
-  }
-
-  XSync (xcontext->disp, FALSE);
-beach:
-  if (meta->parent) {
-    /* Release the ref to our parent */
-    gst_object_unref (meta->parent);
-    meta->parent = NULL;
-  }
-
-  return;
 }
