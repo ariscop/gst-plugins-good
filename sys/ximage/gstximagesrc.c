@@ -359,12 +359,46 @@ gst_ximage_src_unlock (GstBaseSrc * basesrc)
 static gboolean
 gst_ximage_src_recalc (GstXImageSrc * src)
 {
+  gboolean res;
+  GstEvent *event;
+  GstCaps *caps;
+  GstPad *pad;
+  XWindowAttributes attrs;
+
   if (!src->xcontext)
     return FALSE;
 
-  /* Maybe later we can check the display hasn't changed size */
-  /* We could use XQueryPointer to get only the current window. */
-  return TRUE;
+  if (XGetWindowAttributes (src->xcontext->disp, src->window, &attrs)
+      && src->width == attrs.width && src->height == attrs.height)
+    return TRUE;
+
+#ifdef HAVE_XCOMPOSITE
+  if (src->have_xcomposite) {
+    XFreePixmap (src->xcontext->disp, src->pixmap);
+    src->pixmap = XCompositeNameWindowPixmap (src->xcontext->disp, src->window);
+    gst_ximage_get_pixmap_size (src->xcontext, src->pixmap, &src->width,
+        &src->height);
+  } else
+#endif
+  {
+    src->width = attrs.width;
+    src->height = attrs.height;
+  }
+
+  pad = GST_BASE_SRC (src)->srcpad;
+  caps = gst_pad_get_current_caps (pad);
+  if (!caps)
+    return FALSE;
+
+  caps = gst_caps_make_writable (caps);
+  gst_caps_set_simple (caps,
+      "width", G_TYPE_INT, src->width, "height", G_TYPE_INT, src->height, NULL);
+
+  event = gst_event_new_caps (caps);
+  gst_caps_unref (caps);
+
+  res = gst_pad_push_event (pad, event);
+  return res;
 }
 
 #ifdef HAVE_XFIXES
