@@ -29,6 +29,9 @@
 #ifdef HAVE_XDAMAGE
 #include <X11/extensions/Xdamage.h>
 #endif
+#ifdef HAVE_XCOMPOSITE
+#include <X11/extensions/Xcomposite.h>
+#endif
 
 G_BEGIN_DECLS
 
@@ -74,6 +77,7 @@ struct _GstXImageSrc
   /* XFixes and XDamage support */
   gboolean have_xfixes;
   gboolean have_xdamage;
+  gboolean have_xcomposite;
   gboolean show_pointer;
   gboolean use_damage;
 
@@ -96,6 +100,9 @@ struct _GstXImageSrc
   XserverRegion damage_region;
   GC damage_copy_gc;
   GstBuffer *last_ximage;
+#endif
+#ifdef HAVE_XCOMPOSITE
+  int composite_event_base;
 #endif
 };
 

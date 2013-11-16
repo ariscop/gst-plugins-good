@@ -231,6 +231,21 @@ use_root_window:
     }
   }
 #endif
+#ifdef HAVE_XCOMPOSITE
+  {
+    int error_base;
+
+    s->have_xcomposite = FALSE;
+
+    if (XCompositeQueryExtension (s->xcontext->disp, &s->composite_event_base,
+            &error_base)) {
+      s->have_xcomposite = TRUE;
+      GST_DEBUG_OBJECT (s, "Using XComposite extension");
+    } else {
+      GST_DEBUG_OBJECT (s, "X Server does not have XComposite extension");
+    }
+  }
+#endif
 #endif
 
   g_mutex_unlock (&s->x_lock);
