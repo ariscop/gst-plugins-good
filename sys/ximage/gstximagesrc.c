@@ -113,6 +113,23 @@ gst_ximage_src_find_window (GstXImageSrc * src, Window root, const char *name)
 }
 
 static gboolean
+gst_ximage_get_pixmap_size (GstXContext * s, Drawable d, gint * width,
+    gint * height)
+{
+  Window dummy1;
+  int dummy2, status;
+  unsigned int dummy3, _width, _height;
+
+  status = XGetGeometry (s->disp, d, &dummy1,
+      &dummy2, &dummy2, &_width, &_height, &dummy3, &dummy3);
+
+  *width = _width;
+  *height = _height;
+
+  return status ? TRUE : FALSE;
+}
+
+static gboolean
 gst_ximage_src_open_display (GstXImageSrc * s, const gchar * name)
 {
   g_return_val_if_fail (GST_IS_XIMAGE_SRC (s), FALSE);
@@ -132,7 +149,7 @@ gst_ximage_src_open_display (GstXImageSrc * s, const gchar * name)
   s->width = s->xcontext->width;
   s->height = s->xcontext->height;
 
-  s->xwindow = s->xcontext->root;
+  s->window = s->xcontext->root;
   if (s->xid != 0 || s->xname) {
     int status;
     XWindowAttributes attrs;
@@ -142,7 +159,7 @@ gst_ximage_src_open_display (GstXImageSrc * s, const gchar * name)
       status = XGetWindowAttributes (s->xcontext->disp, s->xid, &attrs);
       if (status) {
         GST_DEBUG_OBJECT (s, "Found window XID %" G_GUINT64_FORMAT, s->xid);
-        s->xwindow = s->xid;
+        s->window = s->xid;
         goto window_found;
       } else {
         GST_WARNING_OBJECT (s, "Failed to get window %" G_GUINT64_FORMAT
@@ -157,7 +174,7 @@ gst_ximage_src_open_display (GstXImageSrc * s, const gchar * name)
         GST_DEBUG_OBJECT (s, "Found window named %s, ", s->xname);
         status = XGetWindowAttributes (s->xcontext->disp, window, &attrs);
         if (status) {
-          s->xwindow = window;
+          s->window = window;
           goto window_found;
         } else {
           GST_WARNING_OBJECT (s, "Failed to get window attributes for "
@@ -170,13 +187,14 @@ gst_ximage_src_open_display (GstXImageSrc * s, const gchar * name)
     goto use_root_window;
 
   window_found:
-    g_assert (s->xwindow != 0);
+    g_assert (s->window != 0);
     s->width = attrs.width;
     s->height = attrs.height;
     GST_INFO_OBJECT (s, "Using default window size of %dx%d",
         s->width, s->height);
   }
 use_root_window:
+  s->pixmap = s->window;
 
 #ifdef HAVE_XFIXES
   /* check if xfixes supported */
@@ -207,7 +225,7 @@ use_root_window:
     if (XDamageQueryExtension (s->xcontext->disp, &s->damage_event_base,
             &error_base)) {
       s->damage =
-          XDamageCreate (s->xcontext->disp, s->xwindow, XDamageReportNonEmpty);
+          XDamageCreate (s->xcontext->disp, s->window, XDamageReportNonEmpty);
       if (s->damage != None) {
         s->damage_region = XFixesCreateRegion (s->xcontext->disp, NULL, 0);
         if (s->damage_region != None) {
@@ -216,8 +234,8 @@ use_root_window:
           GST_DEBUG_OBJECT (s, "Using XDamage extension");
           values.subwindow_mode = IncludeInferiors;
           s->damage_copy_gc = XCreateGC (s->xcontext->disp,
-              s->xwindow, GCSubwindowMode, &values);
-          XSelectInput (s->xcontext->disp, s->xwindow, evmask);
+              s->window, GCSubwindowMode, &values);
+          XSelectInput (s->xcontext->disp, s->window, evmask);
 
           s->have_xdamage = TRUE;
         } else {
@@ -240,7 +258,16 @@ use_root_window:
     if (XCompositeQueryExtension (s->xcontext->disp, &s->composite_event_base,
             &error_base)) {
       s->have_xcomposite = TRUE;
-      GST_DEBUG_OBJECT (s, "Using XComposite extension");
+      XCompositeRedirectWindow (s->xcontext->disp, s->window,
+          CompositeRedirectAutomatic);
+      s->pixmap = XCompositeNameWindowPixmap (s->xcontext->disp, s->window);
+      if (!s->pixmap) {
+        s->pixmap = s->window;
+        s->have_xcomposite = TRUE;
+        GST_DEBUG_OBJECT (s, "Failed to pixmap, not using XComposite");
+      } else {
+        GST_DEBUG_OBJECT (s, "Using XComposite extension");
+      }
     } else {
       GST_DEBUG_OBJECT (s, "X Server does not have XComposite extension");
     }
@@ -530,7 +557,7 @@ gst_ximage_src_ximage_get (GstXImageSrc * ximagesrc)
                 GST_LOG_OBJECT (ximagesrc,
                     "Retrieving damaged sub-region @ %d,%d size %dx%d as intersect region",
                     startx, starty, width, height);
-                XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->xwindow,
+                XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
                     startx, starty, width, height, AllPlanes, ZPixmap,
                     meta->ximage, startx - ximagesrc->startx,
                     starty - ximagesrc->starty);
@@ -541,7 +568,7 @@ gst_ximage_src_ximage_get (GstXImageSrc * ximagesrc)
                   "Retrieving damaged sub-region @ %d,%d size %dx%d",
                   rects[i].x, rects[i].y, rects[i].width, rects[i].height);
 
-              XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->xwindow,
+              XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
                   rects[i].x, rects[i].y,
                   rects[i].width, rects[i].height,
                   AllPlanes, ZPixmap, meta->ximage, rects[i].x, rects[i].y);
@@ -602,7 +629,7 @@ gst_ximage_src_ximage_get (GstXImageSrc * ximagesrc)
           iheight = (y + height < ximagesrc->endy) ?
               y + height - starty : ximagesrc->endy - starty;
           GST_DEBUG_OBJECT (ximagesrc, "Removing cursor from %d,%d", x, y);
-          XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->xwindow,
+          XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
               startx, starty, iwidth, iheight, AllPlanes, ZPixmap,
               meta->ximage, startx - ximagesrc->startx,
               starty - ximagesrc->starty);
@@ -610,7 +637,7 @@ gst_ximage_src_ximage_get (GstXImageSrc * ximagesrc)
       } else {
 
         GST_DEBUG_OBJECT (ximagesrc, "Removing cursor from %d,%d", x, y);
-        XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->xwindow,
+        XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
             x, y, width, height, AllPlanes, ZPixmap, meta->ximage, x, y);
       }
     }
@@ -623,7 +650,7 @@ gst_ximage_src_ximage_get (GstXImageSrc * ximagesrc)
 #ifdef HAVE_XSHM
     if (ximagesrc->xcontext->use_xshm) {
       GST_DEBUG_OBJECT (ximagesrc, "Retrieving screen using XShm");
-      XShmGetImage (ximagesrc->xcontext->disp, ximagesrc->xwindow,
+      XShmGetImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
           meta->ximage, ximagesrc->startx, ximagesrc->starty, AllPlanes);
 
     } else
@@ -631,12 +658,12 @@ gst_ximage_src_ximage_get (GstXImageSrc * ximagesrc)
     {
       GST_DEBUG_OBJECT (ximagesrc, "Retrieving screen using XGetImage");
       if (ximagesrc->remote) {
-        XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->xwindow,
+        XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
             ximagesrc->startx, ximagesrc->starty, ximagesrc->width,
             ximagesrc->height, AllPlanes, ZPixmap, meta->ximage, 0, 0);
       } else {
         meta->ximage =
-            XGetImage (ximagesrc->xcontext->disp, ximagesrc->xwindow,
+            XGetImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
             ximagesrc->startx, ximagesrc->starty, ximagesrc->width,
             ximagesrc->height, AllPlanes, ZPixmap);
       }
@@ -976,15 +1003,9 @@ gst_ximage_src_get_caps (GstBaseSrc * bs, GstCaps * filter)
     return gst_pad_get_pad_template_caps (GST_BASE_SRC (s)->srcpad);
 
   xcontext = s->xcontext;
-  width = s->xcontext->width;
-  height = s->xcontext->height;
-  if (s->xwindow != 0) {
-    XWindowAttributes attrs;
-    int status = XGetWindowAttributes (s->xcontext->disp, s->xwindow, &attrs);
-    if (status) {
-      width = attrs.width;
-      height = attrs.height;
-    }
+  if (!gst_ximage_get_pixmap_size (s->xcontext, s->pixmap, &width, &height)) {
+    width = s->xcontext->width;
+    height = s->xcontext->height;
   }
 
   /* property comments say 0 means right/bottom, means we can't capture

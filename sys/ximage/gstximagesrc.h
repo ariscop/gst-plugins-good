@@ -55,7 +55,8 @@ struct _GstXImageSrc
   gint width;
   gint height;
 
-  Window xwindow;
+  Window window;
+  Pixmap pixmap;
   gchar *display_name;
   guint screen_num;
 
