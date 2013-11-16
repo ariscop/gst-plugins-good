@@ -35,6 +35,10 @@
 #include <X11/extensions/XShm.h>
 #endif /* HAVE_XSHM */
 
+#ifdef HAVE_XCOMPOSITE
+#include <X11/extensions/Xcomposite.h>
+#endif /* HAVE_XCOMPOSITE */
+
 #include <string.h>
 #include <math.h>
 

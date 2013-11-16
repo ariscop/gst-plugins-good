@@ -9,7 +9,8 @@ libgstximagesrc_la_CFLAGS = \
 libgstximagesrc_la_LIBADD = \
 	$(GST_PLUGINS_BASE_LIBS) -lgstvideo-$(GST_API_VERSION) \
 	$(GST_BASE_LIBS) \
-	$(X_LIBS) $(XSHM_LIBS) $(XFIXES_LIBS) $(XDAMAGE_LIBS) 
+	$(X_LIBS) $(XSHM_LIBS) $(XFIXES_LIBS) $(XDAMAGE_LIBS) \
+	$(XCOMPOSITE_LIBS)
 libgstximagesrc_la_LDFLAGS = $(GST_PLUGIN_LDFLAGS)
 libgstximagesrc_la_LIBTOOLFLAGS = $(GST_PLUGIN_LIBTOOLFLAGS)
 

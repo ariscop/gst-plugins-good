@@ -708,6 +708,21 @@ AG_GST_CHECK_FEATURE(XSHM, [X Shared Memory extension], , [
   AC_SUBST(XSHM_LIBS)
 ])
 
+translit(dnm, m, l) AM_CONDITIONAL(USE_XCOMPOSITE, true)
+AG_GST_CHECK_FEATURE(XCOMPOSITE, [X Composite extension], , [
+  if test x$HAVE_X = xyes; then
+    AC_CHECK_LIB(Xcomposite, XCompositeNameWindowPixmap,
+                 HAVE_XCOMPOSITE="yes", HAVE_XCOMPOSITE="no",
+                 $X_LIBS)
+    if test "x$HAVE_XCOMPOSITE" = "xyes"; then
+      XCOMPOSITE_LIBS="-lXcomposite"
+    fi
+  fi
+], ,[
+  AC_SUBST(HAVE_XCOMPOSITE)
+  AC_SUBST(XCOMPOSITE_LIBS)
+])
+
 dnl for V4L2, we also need to know if we have XVIDEO
 translit(dnm, m, l) AM_CONDITIONAL(USE_XVIDEO, true)
 AG_GST_CHECK_FEATURE(XVIDEO, [X11 XVideo extensions],
@@ -1051,6 +1066,7 @@ AM_CONDITIONAL(USE_WAVEFORM, false)
 AM_CONDITIONAL(USE_WAVPACK, false)
 AM_CONDITIONAL(USE_X, false)
 AM_CONDITIONAL(USE_XSHM, false)
+AM_CONDITIONAL(USE_XCOMPOSITE, false)
 AM_CONDITIONAL(USE_XVIDEO, false)
 AM_CONDITIONAL(USE_ZLIB, false)
 
