@@ -328,6 +328,9 @@ gst_ximagesrc_buffer_dispose (GstBuffer * ximage)
   if (parent == NULL)
     g_warning ("XImageSrcBuffer->ximagesrc == NULL");
 
+  if (meta->return_func)
+    meta->return_func (parent, ximage);
+
   return;
 }
 
@@ -380,7 +383,7 @@ beach:
 /* This function handles GstXImageSrcBuffer creation depending on XShm availability */
 GstBuffer *
 gst_ximageutil_ximage_new (GstXContext * xcontext,
-    GstElement * parent, int width, int height)
+    GstElement * parent, int width, int height, BufferReturnFunc return_func)
 {
   GstBuffer *ximage = NULL;
   GstMetaXImage *meta;
@@ -395,6 +398,7 @@ gst_ximageutil_ximage_new (GstXContext * xcontext,
   meta = GST_META_XIMAGE_ADD (ximage);
   meta->width = width;
   meta->height = height;
+  meta->return_func = return_func;
 
 #ifdef HAVE_XSHM
   meta->SHMInfo.shmaddr = ((void *) -1);

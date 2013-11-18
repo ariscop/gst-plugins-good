@@ -255,6 +255,15 @@ gst_ximage_src_start (GstBaseSrc * basesrc)
   return gst_ximage_src_open_display (s, s->display_name);
 }
 
+static void
+gst_ximage_src_pool_free (GstBuffer * ximage)
+{
+  GstMetaXImage *meta;
+  meta = GST_META_XIMAGE_GET (ximage);
+  meta->return_func = NULL;
+  gst_buffer_unref (ximage);
+}
+
 static gboolean
 gst_ximage_src_stop (GstBaseSrc * basesrc)
 {
@@ -265,6 +274,9 @@ gst_ximage_src_stop (GstBaseSrc * basesrc)
     gst_buffer_unref (GST_BUFFER_CAST (src->last_ximage));
   src->last_ximage = NULL;
 #endif
+
+  g_list_free_full (src->buffer_pool,
+      (GDestroyNotify) gst_ximage_src_pool_free);
 
 #ifdef HAVE_XFIXES
   if (src->cursor_image)
@@ -417,31 +429,71 @@ copy_buffer (GstBuffer * dest, GstBuffer * src)
 }
 #endif
 
+static void
+gst_ximage_buffer_return (GstXImageSrc * ximagesrc, GstBuffer * buf)
+{
+  GstMetaXImage *meta;
+  meta = GST_META_XIMAGE_GET (buf);
+
+  g_mutex_lock (&ximagesrc->x_lock);
+  if (meta->width == ximagesrc->width && meta->height == ximagesrc->height) {
+    gst_buffer_ref (buf);
+    ximagesrc->buffer_pool = g_list_prepend (ximagesrc->buffer_pool, buf);
+  }
+  g_mutex_unlock (&ximagesrc->x_lock);
+}
+
+static GstBuffer *
+gst_ximage_get_buffer (GstXImageSrc * ximagesrc)
+{
+  GstBuffer *ximage;
+  GList *list;
+
+  g_mutex_lock (&ximagesrc->x_lock);
+
+  list = ximagesrc->buffer_pool;
+  while (list) {
+    GstMetaXImage *meta;
+    meta = GST_META_XIMAGE_GET (list->data);
+
+    if (meta->width == ximagesrc->width && meta->height == ximagesrc->height) {
+      ximage = list->data;
+      ximagesrc->buffer_pool =
+          g_list_remove (ximagesrc->buffer_pool, list->data);
+      goto done;
+    } else {
+      GST_ELEMENT_ERROR (ximagesrc, RESOURCE, WRITE, (NULL),
+          ("buffer of unexpected size in pool. (%dx%x) expected (%dx%d)\n",
+              meta->width, meta->height, ximagesrc->width, ximagesrc->height));
+    }
+    list = g_list_next (list);
+  }
+
+  GST_DEBUG_OBJECT (ximagesrc, "creating image (%dx%d)",
+      ximagesrc->width, ximagesrc->height);
+  ximage = gst_ximageutil_ximage_new (ximagesrc->xcontext,
+      GST_ELEMENT (ximagesrc), ximagesrc->width, ximagesrc->height,
+      (BufferReturnFunc) gst_ximage_buffer_return);
+  if (ximage == NULL)
+    GST_ELEMENT_ERROR (ximagesrc, RESOURCE, WRITE, (NULL),
+        ("could not create a %dx%d ximage", ximagesrc->width,
+            ximagesrc->height));
+done:
+  g_mutex_unlock (&ximagesrc->x_lock);
+  return ximage;
+}
+
 /* Retrieve an XImageSrcBuffer, preferably from our
  * pool of existing images and populate it from the window */
 static GstBuffer *
 gst_ximage_src_ximage_get (GstXImageSrc * ximagesrc)
 {
-  GstBuffer *ximage = NULL;
+  GstBuffer *ximage;
   GstMetaXImage *meta;
 
-  if (ximage == NULL) {
-    GST_DEBUG_OBJECT (ximagesrc, "creating image (%dx%d)",
-        ximagesrc->width, ximagesrc->height);
-
-    g_mutex_lock (&ximagesrc->x_lock);
-    ximage = gst_ximageutil_ximage_new (ximagesrc->xcontext,
-        GST_ELEMENT (ximagesrc), ximagesrc->width, ximagesrc->height);
-    if (ximage == NULL) {
-      GST_ELEMENT_ERROR (ximagesrc, RESOURCE, WRITE, (NULL),
-          ("could not create a %dx%d ximage", ximagesrc->width,
-              ximagesrc->height));
-      g_mutex_unlock (&ximagesrc->x_lock);
-      return NULL;
-    }
-
-    g_mutex_unlock (&ximagesrc->x_lock);
-  }
+  ximage = gst_ximage_get_buffer (ximagesrc);
+  if (ximage == NULL)
+    return NULL;
 
   g_return_val_if_fail (GST_IS_XIMAGE_SRC (ximagesrc), NULL);
 
@@ -1210,6 +1262,7 @@ gst_ximage_src_init (GstXImageSrc * ximagesrc)
   ximagesrc->endx = 0;
   ximagesrc->endy = 0;
   ximagesrc->remote = FALSE;
+  ximagesrc->buffer_pool = NULL;
 }
 
 static gboolean

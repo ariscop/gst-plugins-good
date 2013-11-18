@@ -133,6 +133,9 @@ void ximageutil_calculate_pixel_aspect_ratio (GstXContext * xcontext);
 
 /* custom ximagesrc buffer, copied from ximagesink */
 
+/* BufferReturnFunc is called when a buffer is disposed */
+typedef void (*BufferReturnFunc) (GstElement *parent, GstBuffer *buf);
+
 /**
  * GstMetaXImage:
  * @parent: a reference to the element we belong to
@@ -160,6 +163,8 @@ struct _GstMetaXImage {
 
   gint width, height;
   size_t size;
+
+  BufferReturnFunc return_func;
 };
 
 GType gst_meta_ximage_api_get_type (void);
@@ -168,7 +173,7 @@ const GstMetaInfo * gst_meta_ximage_get_info (void);
 #define GST_META_XIMAGE_ADD(buf) ((GstMetaXImage *)gst_buffer_add_meta(buf,gst_meta_ximage_get_info(),NULL))
 
 GstBuffer *gst_ximageutil_ximage_new (GstXContext *xcontext,
-  GstElement *parent, int width, int height);
+  GstElement *parent, int width, int height, BufferReturnFunc return_func);
 
 G_END_DECLS 
 
