@@ -132,6 +132,7 @@ gst_ximage_get_pixmap_size (GstXContext * s, Drawable d, gint * width,
 static gboolean
 gst_ximage_src_open_display (GstXImageSrc * s, const gchar * name)
 {
+  long event_mask = StructureNotifyMask;
   g_return_val_if_fail (GST_IS_XIMAGE_SRC (s), FALSE);
 
   if (s->xcontext != NULL)
@@ -275,6 +276,8 @@ use_root_window:
 #endif
 #endif
 
+  XSelectInput (s->xcontext->disp, s->window, event_mask);
+
   g_mutex_unlock (&s->x_lock);
 
   if (s->xcontext == NULL)
@@ -368,19 +371,22 @@ gst_ximage_src_recalc (GstXImageSrc * src)
   if (!src->xcontext)
     return FALSE;
 
-  if (XGetWindowAttributes (src->xcontext->disp, src->window, &attrs)
-      && src->width == attrs.width && src->height == attrs.height)
-    return TRUE;
-
 #ifdef HAVE_XCOMPOSITE
   if (src->have_xcomposite) {
+    Pixmap pixmap;
     XFreePixmap (src->xcontext->disp, src->pixmap);
-    src->pixmap = XCompositeNameWindowPixmap (src->xcontext->disp, src->window);
-    gst_ximage_get_pixmap_size (src->xcontext, src->pixmap, &src->width,
+    pixmap = XCompositeNameWindowPixmap (src->xcontext->disp, src->window);
+    if (!pixmap)
+      return FALSE;
+    gst_ximage_get_pixmap_size (src->xcontext, pixmap, &src->width,
         &src->height);
+    src->pixmap = pixmap;
   } else
 #endif
   {
+    if (!XGetWindowAttributes (src->xcontext->disp, src->window, &attrs)
+        && src->width == attrs.width && src->height == attrs.height)
+      return FALSE;
     src->width = attrs.width;
     src->height = attrs.height;
   }
@@ -493,6 +499,60 @@ copy_buffer (GstBuffer * dest, GstBuffer * src)
 }
 #endif
 
+/*
+ * XDamage is rather slow, but partial
+ * updates from remote x servers would
+ * benefit. i doubt this is the common
+ * case, but no need to remove support
+
+gst_ximage_capture()
+    list damage_areas = []
+    bool resize = false
+    bool destroy = false
+    bool mouse_change = false
+    while(event = next_event())
+        switch(event)
+            mouse_entered:
+            mouse_moved:
+                mouse_position = event.position (reletive to window)
+            mouse_leave:
+                mouse_position = null (no mouse)
+            mouse_configure:
+                mouse_change = true
+            damage_event:
+                damage_areas.add(event.area)
+            resize_event:
+                resize = true
+            destroy_event:
+                destroy = true
+    if (resize)
+        grab_pixmap()
+        if (!update_caps()) //new caps not accepted
+            exit
+        goto capture_full
+
+    if(!partial_capture)
+        goto capture_full
+    if(!previous)
+        goto capture_full
+capture_partial:
+    if(damage_areas == 0)
+        return previous
+    next = dupe(previous)
+    for area in damage_areas
+        XGrabArea(next, area, dst)
+    previous = next
+    goto mouse
+capture_full:
+    next = new buffer
+mouse:
+    if(mouse_position != null)
+        if(mouse_change)
+            cursor_image = get_cursor_image()
+        draw_mouse(cursor_image, mouse_position)
+    return next
+*/
+
 /* Retrieve an XImageSrcBuffer, preferably from our
  * pool of existing images and populate it from the window */
 static GstBuffer *
@@ -500,306 +560,66 @@ gst_ximage_src_ximage_get (GstXImageSrc * ximagesrc)
 {
   GstBuffer *ximage = NULL;
   GstMetaXImage *meta;
+  gboolean resize = FALSE, destroy = FALSE;
+
+  g_return_val_if_fail (GST_IS_XIMAGE_SRC (ximagesrc), NULL);
+
+  /* Drain event queue */
+  g_mutex_lock (&ximagesrc->x_lock);
+  while (XEventsQueued (ximagesrc->xcontext->disp, QueuedAfterReading)) {
+    XEvent ev;
+    XNextEvent (ximagesrc->xcontext->disp, &ev);
+
+    switch (ev.type) {
+      case ConfigureNotify:
+        resize = TRUE;
+        break;
+      default:
+        break;
+    }
+  }
+  g_mutex_unlock (&ximagesrc->x_lock);
+
+  if (resize)
+    gst_ximage_src_recalc (ximagesrc);
 
   if (ximage == NULL) {
     GST_DEBUG_OBJECT (ximagesrc, "creating image (%dx%d)",
         ximagesrc->width, ximagesrc->height);
 
-    g_mutex_lock (&ximagesrc->x_lock);
     ximage = gst_ximageutil_ximage_new (ximagesrc->xcontext,
         GST_ELEMENT (ximagesrc), ximagesrc->width, ximagesrc->height);
     if (ximage == NULL) {
       GST_ELEMENT_ERROR (ximagesrc, RESOURCE, WRITE, (NULL),
           ("could not create a %dx%d ximage", ximagesrc->width,
               ximagesrc->height));
-      g_mutex_unlock (&ximagesrc->x_lock);
-      return NULL;
+      return FALSE;
     }
-
-    g_mutex_unlock (&ximagesrc->x_lock);
   }
-
-  g_return_val_if_fail (GST_IS_XIMAGE_SRC (ximagesrc), NULL);
-
   meta = GST_META_XIMAGE_GET (ximage);
 
-#ifdef HAVE_XDAMAGE
-  if (ximagesrc->have_xdamage && ximagesrc->use_damage &&
-      ximagesrc->last_ximage != NULL) {
-    XEvent ev;
-
-    /* have_frame is TRUE when either the entire screen has been
-     * grabbed or when the last image has been copied */
-    gboolean have_frame = FALSE;
-
-    GST_DEBUG_OBJECT (ximagesrc, "Retrieving screen using XDamage");
-
-    do {
-      XNextEvent (ximagesrc->xcontext->disp, &ev);
-
-      if (ev.type == ximagesrc->damage_event_base + XDamageNotify) {
-        XserverRegion parts;
-        XRectangle *rects;
-        int nrects;
-
-        parts = XFixesCreateRegion (ximagesrc->xcontext->disp, 0, 0);
-        XDamageSubtract (ximagesrc->xcontext->disp, ximagesrc->damage, None,
-            parts);
-        /* Now copy out all of the damaged rectangles. */
-        rects = XFixesFetchRegion (ximagesrc->xcontext->disp, parts, &nrects);
-        if (rects != NULL) {
-          int i;
-
-          if (!have_frame) {
-            GST_LOG_OBJECT (ximagesrc,
-                "Copying from last frame ximage->size: %" G_GSIZE_FORMAT,
-                gst_buffer_get_size (ximage));
-            copy_buffer (ximage, ximagesrc->last_ximage);
-            have_frame = TRUE;
-          }
-          for (i = 0; i < nrects; i++) {
-            GST_LOG_OBJECT (ximagesrc,
-                "Damaged sub-region @ %d,%d size %dx%d reported",
-                rects[i].x, rects[i].y, rects[i].width, rects[i].height);
-
-            /* if we only want a small area, clip this damage region to
-             * area we want */
-            if (ximagesrc->endx > ximagesrc->startx &&
-                ximagesrc->endy > ximagesrc->starty) {
-              /* see if damage area intersects */
-              if (rects[i].x + rects[i].width - 1 < ximagesrc->startx ||
-                  rects[i].x > ximagesrc->endx) {
-                /* trivial reject */
-              } else if (rects[i].y + rects[i].height - 1 < ximagesrc->starty ||
-                  rects[i].y > ximagesrc->endy) {
-                /* trivial reject */
-              } else {
-                /* find intersect region */
-                int startx, starty, width, height;
-
-                startx = (rects[i].x < ximagesrc->startx) ? ximagesrc->startx :
-                    rects[i].x;
-                starty = (rects[i].y < ximagesrc->starty) ? ximagesrc->starty :
-                    rects[i].y;
-                width = (rects[i].x + rects[i].width - 1 < ximagesrc->endx) ?
-                    rects[i].x + rects[i].width - startx :
-                    ximagesrc->endx - startx + 1;
-                height = (rects[i].y + rects[i].height - 1 < ximagesrc->endy) ?
-                    rects[i].y + rects[i].height - starty : ximagesrc->endy -
-                    starty + 1;
-
-                GST_LOG_OBJECT (ximagesrc,
-                    "Retrieving damaged sub-region @ %d,%d size %dx%d as intersect region",
-                    startx, starty, width, height);
-                XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
-                    startx, starty, width, height, AllPlanes, ZPixmap,
-                    meta->ximage, startx - ximagesrc->startx,
-                    starty - ximagesrc->starty);
-              }
-            } else {
-
-              GST_LOG_OBJECT (ximagesrc,
-                  "Retrieving damaged sub-region @ %d,%d size %dx%d",
-                  rects[i].x, rects[i].y, rects[i].width, rects[i].height);
-
-              XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
-                  rects[i].x, rects[i].y,
-                  rects[i].width, rects[i].height,
-                  AllPlanes, ZPixmap, meta->ximage, rects[i].x, rects[i].y);
-            }
-          }
-          free (rects);
-        }
-      }
-    } while (XPending (ximagesrc->xcontext->disp));
-    if (!have_frame) {
-      GST_LOG_OBJECT (ximagesrc,
-          "Copying from last frame ximage->size: %" G_GSIZE_FORMAT,
-          gst_buffer_get_size (ximage));
-      copy_buffer (ximage, ximagesrc->last_ximage);
-    }
-#ifdef HAVE_XFIXES
-    /* re-get area where last mouse pointer was  but only if in our clipping
-     * bounds */
-    if (ximagesrc->cursor_image) {
-      gint x, y, width, height;
-
-      x = ximagesrc->cursor_image->x - ximagesrc->cursor_image->xhot;
-      y = ximagesrc->cursor_image->y - ximagesrc->cursor_image->yhot;
-      width = ximagesrc->cursor_image->width;
-      height = ximagesrc->cursor_image->height;
-
-      /* bounds checking */
-      if (x < 0)
-        x = 0;
-      if (y < 0)
-        y = 0;
-      if (x + width > ximagesrc->xcontext->width)
-        width = ximagesrc->xcontext->width - x;
-      if (y + height > ximagesrc->xcontext->height)
-        height = ximagesrc->xcontext->height - y;
-      g_assert (x >= 0);
-      g_assert (y >= 0);
-      GST_DEBUG_OBJECT (ximagesrc,
-          "Cursor was at (%d,%d) width: %d, height: %d and our range is: (%d,%d) - (%d,%d)",
-          x, y, width, height, ximagesrc->startx, ximagesrc->starty,
-          ximagesrc->endx, ximagesrc->endy);
-      /* only get where cursor last was, if it is in our range */
-      if (ximagesrc->endx > ximagesrc->startx &&
-          ximagesrc->endy > ximagesrc->starty) {
-        /* check bounds */
-        if (x + width < ximagesrc->startx || x > ximagesrc->endx) {
-          /* trivial reject */
-        } else if (y + height < ximagesrc->starty || y > ximagesrc->endy) {
-          /* trivial reject */
-        } else {
-          /* find intersect region */
-          int startx, starty, iwidth, iheight;
-
-          startx = (x < ximagesrc->startx) ? ximagesrc->startx : x;
-          starty = (y < ximagesrc->starty) ? ximagesrc->starty : y;
-          iwidth = (x + width < ximagesrc->endx) ?
-              x + width - startx : ximagesrc->endx - startx;
-          iheight = (y + height < ximagesrc->endy) ?
-              y + height - starty : ximagesrc->endy - starty;
-          GST_DEBUG_OBJECT (ximagesrc, "Removing cursor from %d,%d", x, y);
-          XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
-              startx, starty, iwidth, iheight, AllPlanes, ZPixmap,
-              meta->ximage, startx - ximagesrc->startx,
-              starty - ximagesrc->starty);
-        }
-      } else {
-
-        GST_DEBUG_OBJECT (ximagesrc, "Removing cursor from %d,%d", x, y);
-        XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
-            x, y, width, height, AllPlanes, ZPixmap, meta->ximage, x, y);
-      }
-    }
-#endif
-
-
-  } else {
-#endif
-
 #ifdef HAVE_XSHM
-    if (ximagesrc->xcontext->use_xshm) {
-      GST_DEBUG_OBJECT (ximagesrc, "Retrieving screen using XShm");
-      XShmGetImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
-          meta->ximage, ximagesrc->startx, ximagesrc->starty, AllPlanes);
-
-    } else
-#endif /* HAVE_XSHM */
-    {
-      GST_DEBUG_OBJECT (ximagesrc, "Retrieving screen using XGetImage");
-      if (ximagesrc->remote) {
-        XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
-            ximagesrc->startx, ximagesrc->starty, ximagesrc->width,
-            ximagesrc->height, AllPlanes, ZPixmap, meta->ximage, 0, 0);
-      } else {
-        meta->ximage =
-            XGetImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
-            ximagesrc->startx, ximagesrc->starty, ximagesrc->width,
-            ximagesrc->height, AllPlanes, ZPixmap);
-      }
-    }
-#ifdef HAVE_XDAMAGE
-  }
-#endif
-
-#ifdef HAVE_XFIXES
-  if (ximagesrc->show_pointer && ximagesrc->have_xfixes) {
-
-    GST_DEBUG_OBJECT (ximagesrc, "Using XFixes to draw cursor");
-    /* get cursor */
-    if (ximagesrc->cursor_image)
-      XFree (ximagesrc->cursor_image);
-    ximagesrc->cursor_image = XFixesGetCursorImage (ximagesrc->xcontext->disp);
-    if (ximagesrc->cursor_image != NULL) {
-      int cx, cy, i, j, count;
-      int startx, starty, iwidth, iheight;
-      gboolean cursor_in_image = TRUE;
-
-      cx = ximagesrc->cursor_image->x - ximagesrc->cursor_image->xhot;
-      if (cx < 0)
-        cx = 0;
-      cy = ximagesrc->cursor_image->y - ximagesrc->cursor_image->yhot;
-      if (cy < 0)
-        cy = 0;
-      count = ximagesrc->cursor_image->width * ximagesrc->cursor_image->height;
-
-      /* only get where cursor last was, if it is in our range */
-      if (ximagesrc->endx > ximagesrc->startx &&
-          ximagesrc->endy > ximagesrc->starty) {
-        /* check bounds */
-        if (cx + ximagesrc->cursor_image->width < ximagesrc->startx ||
-            cx > ximagesrc->endx) {
-          /* trivial reject */
-          cursor_in_image = FALSE;
-        } else if (cy + ximagesrc->cursor_image->height < ximagesrc->starty ||
-            cy > ximagesrc->endy) {
-          /* trivial reject */
-          cursor_in_image = FALSE;
-        } else {
-          /* find intersect region */
-
-          startx = (cx < ximagesrc->startx) ? ximagesrc->startx : cx;
-          starty = (cy < ximagesrc->starty) ? ximagesrc->starty : cy;
-          iwidth = (cx + ximagesrc->cursor_image->width < ximagesrc->endx) ?
-              cx + ximagesrc->cursor_image->width - startx :
-              ximagesrc->endx - startx;
-          iheight = (cy + ximagesrc->cursor_image->height < ximagesrc->endy) ?
-              cy + ximagesrc->cursor_image->height - starty :
-              ximagesrc->endy - starty;
-        }
-      } else {
-        startx = cx;
-        starty = cy;
-        iwidth = ximagesrc->cursor_image->width;
-        iheight = ximagesrc->cursor_image->height;
-      }
-
-      if (cursor_in_image) {
-        GST_DEBUG_OBJECT (ximagesrc, "Cursor is in image so trying to draw it");
-        for (i = 0; i < count; i++)
-          ximagesrc->cursor_image->pixels[i] =
-              GUINT_TO_LE (ximagesrc->cursor_image->pixels[i]);
-        /* copy those pixels across */
-        for (j = starty;
-            j < starty + iheight && j < ximagesrc->starty + ximagesrc->height;
-            j++) {
-          for (i = startx;
-              i < startx + iwidth && i < ximagesrc->startx + ximagesrc->width;
-              i++) {
-            guint8 *src, *dest;
-
-            src =
-                (guint8 *) & (ximagesrc->cursor_image->pixels[((j -
-                            cy) * ximagesrc->cursor_image->width + (i - cx))]);
-            dest =
-                (guint8 *) & (meta->ximage->data[((j -
-                            ximagesrc->starty) * ximagesrc->width + (i -
-                            ximagesrc->startx)) * (ximagesrc->xcontext->bpp /
-                        8)]);
-
-            composite_pixel (ximagesrc->xcontext, (guint8 *) dest,
-                (guint8 *) src);
-          }
-        }
-      }
+  if (ximagesrc->xcontext->use_xshm) {
+    GST_DEBUG_OBJECT (ximagesrc, "Retrieving screen using XShm");
+    XShmGetImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
+        meta->ximage, ximagesrc->startx, ximagesrc->starty, AllPlanes);
+  } else
+#else /* HAVE_XSHM */
+  {
+    GST_DEBUG_OBJECT (ximagesrc, "Retrieving screen using XGetImage");
+    if (ximagesrc->remote) {
+      XGetSubImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
+          ximagesrc->startx, ximagesrc->starty, ximagesrc->width,
+          ximagesrc->height, AllPlanes, ZPixmap, meta->ximage, 0, 0);
+    } else {
+      meta->ximage =
+          XGetImage (ximagesrc->xcontext->disp, ximagesrc->pixmap,
+          ximagesrc->startx, ximagesrc->starty, ximagesrc->width,
+          ximagesrc->height, AllPlanes, ZPixmap);
     }
   }
 #endif
-#ifdef HAVE_XDAMAGE
-  if (ximagesrc->have_xdamage && ximagesrc->use_damage) {
-    /* need to ref ximage to put in last_ximage */
-    gst_buffer_ref (ximage);
-    if (ximagesrc->last_ximage) {
-      gst_buffer_unref (ximagesrc->last_ximage);
-    }
-    ximagesrc->last_ximage = ximage;
-    GST_LOG_OBJECT (ximagesrc, "reffing current buffer for last_ximage");
-  }
-#endif
+
   return ximage;
 }
 
